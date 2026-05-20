@@ -384,8 +384,8 @@ class AcmeClient:
             resp.headers["Location"],
             predicate=is_valid,
             negative_predicate=is_invalid,
-            delay=5.0,
-            max_tries=15,
+            delay=2.0,
+            max_tries=60,
         )
         return finalized
 
