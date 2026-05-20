@@ -106,6 +106,14 @@ class LexiconChallengeSolver(DNS01ChallengeHelper, ChallengeSolver):
         :param text: The text of the TXT record.
         :param views: List of views to set the TXT record in. Defaults to *Intern* and *Extern*.
         :param ttl: Time to live of the TXT record in seconds.
+
+        If a TXT record already exists at ``name`` (e.g. left over from a
+        previous order whose ``cleanup_challenge`` didn't run because it
+        failed mid-flight), some lexicon providers (Cloudflare in
+        particular) return HTTP 400 on duplicate-create. We recover by
+        deleting any existing TXT(s) at the name and re-creating once.
+        Idempotency-via-upsert isn't directly exposed by the lexicon
+        Client API, so delete-then-create is the cleanest path.
         """
         logger.debug("Setting TXT record %s = %s, TTL %d", name, text, ttl)
 
@@ -118,8 +126,47 @@ class LexiconChallengeSolver(DNS01ChallengeHelper, ChallengeSolver):
                     )
                 ]
             )
+            return
         except RequestException as e:
-            logger.debug("Encountered error adding TXT record: %s", e, exc_info=True)
+            logger.warning(
+                "Initial create_record for %s failed (%s); attempting "
+                "delete + recreate in case a stale record is blocking us",
+                name,
+                e,
+            )
+
+        # Best-effort delete of any existing TXT at this name. We pass no
+        # content so providers that support content-less delete remove
+        # every TXT at the name (the stale value is by definition not the
+        # one we're trying to set). Failure here is non-fatal — we still
+        # try create below; that final attempt's error is what propagates.
+        try:
+            await asyncio.gather(
+                *[
+                    self._loop.run_in_executor(
+                        None,
+                        functools.partial(ops.delete_record, rtype="TXT", name=name),
+                    )
+                ]
+            )
+        except Exception as e:
+            logger.debug(
+                "Pre-create delete_record for %s did not succeed (continuing anyway): %s",
+                name,
+                e,
+            )
+
+        try:
+            await asyncio.gather(
+                *[
+                    self._loop.run_in_executor(
+                        None,
+                        functools.partial(ops.create_record, rtype="TXT", name=name, content=text),
+                    )
+                ]
+            )
+        except RequestException as e:
+            logger.debug("Retry create_record for %s failed: %s", name, e, exc_info=True)
             raise ValueError(f"Error adding TXT record: {e}")
 
     async def delete_txt_record(self, ops: "lexicon.client._ClientOperations", name: str, text: str):
