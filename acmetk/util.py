@@ -51,16 +51,7 @@ class DNS01ChallengeHelper:
     class Config(BaseSettings):
         dns_servers: list[str] = Field(default_factory=lambda: list(DNS01ChallengeHelper.DEFAULT_DNS_SERVERS))
         """
-        DNS servers used to verify the TXT record propagated.
-
-        Only consulted when ``query_authoritative`` is *False*. When the
-        default (``query_authoritative=True``) is in effect, each poll
-        instead queries the zone's authoritative nameservers, which is
-        strictly more correct: public resolvers can negative-cache an
-        NXDOMAIN for a ``_acme-challenge.*`` name (e.g. CF's SOA
-        minimum is 1800 s) for longer than ``polling_timeout``
-        (default 300 s), making the broker time out even though the
-        record exists at the authoritative servers.
+        The DNS servers to used to verify the DNS changes propagated.
         """
         polling_delay: float = Field(default_factory=lambda: DNS01ChallengeHelper.POLLING_DELAY)
         """
@@ -69,15 +60,6 @@ class DNS01ChallengeHelper:
         polling_timeout: float = Field(default_factory=lambda: DNS01ChallengeHelper.POLLING_TIMEOUT)
         """
         Timeout in seconds after which placing the TXT record is considered a failure.
-        """
-        query_authoritative: bool = True
-        """
-        If True (default), each poll resolves the zone's authoritative
-        nameservers and queries those directly instead of the
-        ``dns_servers`` list. Bypasses public-resolver negative caching;
-        authoritative DNS is the source of truth and has no negative
-        cache. Set to False to keep the historical behavior of querying
-        ``dns_servers``.
         """
 
     def __init__(self, helper: Config, **kwargs):
@@ -91,78 +73,11 @@ class DNS01ChallengeHelper:
         self.__c: DNS01ChallengeHelper.Config = helper
         self._loop = asyncio.get_event_loop()
         self._resolvers = []
-        # zone-text -> list[Resolver] cache for authoritative-NS lookups.
-        # NS records typically have long TTL (hours-days); caching avoids
-        # re-resolving on every poll iteration. Cleared on solver restart.
-        self._auth_resolvers_cache: dict[str, list[dns.asyncresolver.Resolver]] = {}
 
         for nameserver in helper.dns_servers:
             resolver = dns.asyncresolver.Resolver()
             resolver.nameservers = [nameserver]
             self._resolvers.append(resolver)
-
-    async def _get_authoritative_resolvers(
-        self, name: str
-    ) -> list[dns.asyncresolver.Resolver]:
-        """Return resolvers pointing at the zone's authoritative
-        nameservers. Per-zone result is cached for the lifetime of the
-        solver instance. Falls back to ``self._resolvers`` on any
-        lookup failure.
-        """
-        try:
-            zone = await dns.asyncresolver.zone_for_name(name)
-        except Exception as e:
-            logger.warning(
-                "zone_for_name(%s) failed (%s); using configured dns_servers",
-                name,
-                e,
-            )
-            return self._resolvers
-
-        zone_key = zone.to_text()
-        cached = self._auth_resolvers_cache.get(zone_key)
-        if cached is not None:
-            return cached
-
-        bootstrap = dns.asyncresolver.Resolver()
-        try:
-            ns_resp = await bootstrap.resolve(zone, "NS")
-        except Exception as e:
-            logger.warning(
-                "NS lookup for zone %s failed (%s); using configured dns_servers",
-                zone_key,
-                e,
-            )
-            self._auth_resolvers_cache[zone_key] = self._resolvers
-            return self._resolvers
-
-        resolvers: list[dns.asyncresolver.Resolver] = []
-        for rr in ns_resp:
-            ns_name = rr.target.to_text(omit_final_dot=True)
-            try:
-                a_resp = await bootstrap.resolve(ns_name, "A")
-            except Exception as e:
-                logger.debug("A lookup for NS %s failed: %s", ns_name, e)
-                continue
-            for a in a_resp:
-                resolver = dns.asyncresolver.Resolver()
-                resolver.nameservers = [a.to_text()]
-                resolvers.append(resolver)
-
-        if not resolvers:
-            logger.warning(
-                "no authoritative resolvers resolvable for %s; using configured dns_servers",
-                zone_key,
-            )
-            resolvers = self._resolvers
-
-        self._auth_resolvers_cache[zone_key] = resolvers
-        logger.debug(
-            "authoritative resolvers for %s: %s",
-            zone_key,
-            [r.nameservers[0] for r in resolvers],
-        )
-        return resolvers
 
     @staticmethod
     async def _query_txt_record(resolver: dns.asyncresolver.Resolver, name: str) -> tuple[str, set[str]]:
@@ -183,13 +98,8 @@ class DNS01ChallengeHelper:
         return resolver.nameservers[0], set(txt_records)
 
     async def query_txt_records(self, name: str, text: str) -> tuple[bool, set[str]]:
-        if self.__c.query_authoritative:
-            resolvers = await self._get_authoritative_resolvers(name)
-        else:
-            resolvers = self._resolvers
-
         result_set: list[tuple[str, set[str]]] = await asyncio.gather(
-            *[self._query_txt_record(resolver, name) for resolver in resolvers]
+            *[self._query_txt_record(resolver, name) for resolver in self._resolvers]
         )
         record_sets: dict[str, set[str]] = dict(result_set)
 
